@@ -104,8 +104,10 @@ typedef struct {
 } async_connect_ctx_t;
 
 static void execute_next_query(PGquery *pg);
-static void cleanup_and_destroy(PGquery *pg);
 static void on_parallel_stream_complete(PGquery *pg, void *data);
+static void pg_pool_request(PGpool *pool,
+                            void (*callback)(PGconn *conn, void *data),
+                            void *data);
 
 #ifdef _WIN32
 static void on_timer(uv_timer_t *handle);
