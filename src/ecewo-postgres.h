@@ -20,7 +20,6 @@ typedef struct pg_parallel_s PGparallel;
 // Because we don't need it all time,
 // just like we don't need Res.
 typedef void (*pg_result_cb_t)(PGquery *pg, PGresult *result, void *data);
-
 typedef void (*pg_complete_cb_t)(PGquery *pg, void *data);
 typedef void (*pg_parallel_cb_t)(PGparallel *parallel, int success, void *data);
 
@@ -49,7 +48,7 @@ void pg_pool_return(PGpool *pool, PGconn *conn);
 void pg_pool_get_stats(PGpool *pool, PGPoolStats *stats);
 int pg_pool_cleanup_idle(PGpool *pool, uint64_t max_idle_ms);
 
-PGquery *pg_query_create(PGpool *pool, Arena *arena);
+PGquery *pg_query_create(PGpool *pool, Res *res);
 void pg_query_on_complete(PGquery *pg, pg_complete_cb_t callback, void *data);
 
 int pg_query_queue(PGquery *pg,
@@ -68,7 +67,7 @@ int pg_query_exec_trans(PGquery *pg);
 
 // Create parallel execution context
 // count is number of parallel query streams
-PGparallel *pg_parallel_create(PGpool *pool, int count, Arena *arena);
+PGparallel *pg_parallel_create(PGpool *pool, int count, Res *res);
 
 // Get a query stream by index
 // Each stream executes on its own connection

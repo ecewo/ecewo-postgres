@@ -5,6 +5,14 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
+
+#ifdef ECEWO_DEBUG
+#define LOG_DEBUG(fmt, ...) \
+  fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
+#else
+#define LOG_DEBUG(fmt, ...) ((void)0)
+#endif
 
 #define LOG_ERROR(fmt, ...) \
   fprintf(stderr, "[ERROR] [ecewo-postgres] " fmt "\n", ##__VA_ARGS__)
@@ -31,21 +39,23 @@ struct pg_async_s {
   pg_query_t *query_queue_tail;
   pg_query_t *current_query;
 
-  // Pool integration
-  PGpool *pool; // If non-NULL, release connection on completion
+  PGpool *pool;
+  bool arena_owned;
 
-  // Arena management
-  bool arena_owned; // If true, we borrowed it and must return it
-
-  // Completion callback
   pg_complete_cb_t on_complete;
   void *complete_data;
 
-  // Parallel execution support
-  PGparallel *parallel; // If non-NULL, part of parallel execution
-  int parallel_index; // Index in parallel context
+  PGparallel *parallel;
+  int parallel_index;
 
   bool handle_initialized;
+  atomic_bool handle_closing;
+  bool needs_close;  // Flag to defer close
+  uv_mutex_t handle_mutex;
+
+  Res *res;
+  client_t *client;
+  
 #ifdef _WIN32
   uv_timer_t timer;
 #else
@@ -91,6 +101,8 @@ struct pg_parallel_s {
   pg_parallel_cb_t on_complete;
   void *complete_data;
   uv_mutex_t mutex;
+  Res *res;
+  client_t *client;
 };
 
 typedef struct {
@@ -683,14 +695,39 @@ static void on_handle_closed(uv_handle_t *handle) {
     return;
 
   PGquery *pg = (PGquery *)handle->data;
-  pg->handle_initialized = false;
+  
+  if (pg->pool && pg->conn)
+    pg_pool_return(pg->pool, pg->conn);
+
+  if (pg->on_complete) {
+    if (pg->client) {
+      if (client_is_valid(pg->client)) {
+        pg->on_complete(pg, pg->complete_data);
+      } else {
+        LOG_DEBUG("Client closed before query completion");
+      }
+      client_unref(pg->client);
+      pg->client = NULL;
+    } else {
+      pg->on_complete(pg, pg->complete_data);
+    }
+  }
+
+  uv_mutex_destroy(&pg->handle_mutex);
+
+  if (pg->arena_owned && pg->arena && !pg->parallel)
+    arena_return(pg->arena);
 }
 
 static void cancel_execution(PGquery *pg) {
   if (!pg)
     return;
 
-  if (pg->handle_initialized) {
+  uv_mutex_lock(&pg->handle_mutex);
+  
+  if (pg->needs_close && pg->handle_initialized && !atomic_load(&pg->handle_closing)) {
+    atomic_store(&pg->handle_closing, true);
+    
 #ifdef _WIN32
     uv_timer_stop(&pg->timer);
     if (!uv_is_closing((uv_handle_t *)&pg->timer)) {
@@ -703,6 +740,8 @@ static void cancel_execution(PGquery *pg) {
     }
 #endif
   }
+  
+  uv_mutex_unlock(&pg->handle_mutex);
 
   if (pg->conn && pg->is_executing) {
     PGcancel *cancel = PQgetCancel(pg->conn);
@@ -721,21 +760,30 @@ static void cleanup_and_destroy(PGquery *pg) {
     return;
 
   cancel_execution(pg);
+  
+  if (!pg->handle_initialized) {
+    if (pg->pool && pg->conn)
+      pg_pool_return(pg->pool, pg->conn);
 
-  if (pg->pool && pg->conn)
-    pg_pool_return(pg->pool, pg->conn);
+    if (pg->on_complete) {
+      if (pg->client) {
+        if (client_is_valid(pg->client)) {
+          pg->on_complete(pg, pg->complete_data);
+        } else {
+          LOG_ERROR("Client closed before query completion");
+        }
+        client_unref(pg->client);
+        pg->client = NULL;
+      } else {
+        pg->on_complete(pg, pg->complete_data);
+      }
+    }
 
-  if (pg->on_complete)
-    pg->on_complete(pg, pg->complete_data);
+    uv_mutex_destroy(&pg->handle_mutex);
 
-  // If part of parallel execution, notify the parallel context
-  // Parallel callback is called via on_complete
-
-  if (pg->arena_owned && pg->arena && !pg->parallel)
-    arena_return(pg->arena);
-
-  // PGquery itself is in the arena, so it's freed when arena is returned
-  // If arena is user-managed, user is responsible for cleanup
+    if (pg->arena_owned && pg->arena && !pg->parallel)
+      arena_return(pg->arena);
+  }
 }
 
 static void handle_query_error(PGquery *pg) {
@@ -752,9 +800,7 @@ static void on_timer(uv_timer_t *handle) {
 
   if (!server_is_running()) {
     uv_timer_stop(&pg->timer);
-    if (!uv_is_closing((uv_handle_t *)&pg->timer)) {
-      uv_close((uv_handle_t *)&pg->timer, on_handle_closed);
-    }
+    pg->needs_close = true;
     pg->is_executing = false;
     cleanup_and_destroy(pg);
     return;
@@ -762,6 +808,8 @@ static void on_timer(uv_timer_t *handle) {
 
   if (!PQconsumeInput(pg->conn)) {
     LOG_ERROR("PQconsumeInput failed: %s", PQerrorMessage(pg->conn));
+    uv_timer_stop(&pg->timer);
+    pg->needs_close = true;
     handle_query_error(pg);
     return;
   }
@@ -779,6 +827,7 @@ static void on_timer(uv_timer_t *handle) {
       LOG_ERROR("Query failed: %s", PQresultErrorMessage(result));
       PQclear(result);
       pg->current_query = NULL;
+      pg->needs_close = true;
       handle_query_error(pg);
       return;
     }
@@ -797,6 +846,7 @@ static void on_timer(uv_timer_t *handle) {
   if (pg->query_queue) {
     execute_next_query(pg);
   } else {
+    pg->needs_close = true;
     pg->is_executing = false;
     cleanup_and_destroy(pg);
   }
@@ -812,9 +862,7 @@ static void on_poll(uv_poll_t *handle, int status, int events) {
 
   if (!server_is_running()) {
     uv_poll_stop(&pg->poll);
-    if (!uv_is_closing((uv_handle_t *)&pg->poll)) {
-      uv_close((uv_handle_t *)&pg->poll, on_handle_closed);
-    }
+    pg->needs_close = true;
     pg->is_executing = false;
     cleanup_and_destroy(pg);
     return;
@@ -822,12 +870,16 @@ static void on_poll(uv_poll_t *handle, int status, int events) {
 
   if (status < 0) {
     LOG_ERROR("Poll error: %s", uv_strerror(status));
+    uv_poll_stop(&pg->poll);
+    pg->needs_close = true;
     handle_query_error(pg);
     return;
   }
 
   if (!PQconsumeInput(pg->conn)) {
     LOG_ERROR("PQconsumeInput failed: %s", PQerrorMessage(pg->conn));
+    uv_poll_stop(&pg->poll);
+    pg->needs_close = true;
     handle_query_error(pg);
     return;
   }
@@ -845,6 +897,7 @@ static void on_poll(uv_poll_t *handle, int status, int events) {
       LOG_ERROR("Query failed: %s", PQresultErrorMessage(result));
       PQclear(result);
       pg->current_query = NULL;
+      pg->needs_close = true;
       handle_query_error(pg);
       return;
     }
@@ -863,6 +916,7 @@ static void on_poll(uv_poll_t *handle, int status, int events) {
   if (pg->query_queue) {
     execute_next_query(pg);
   } else {
+    pg->needs_close = true;
     pg->is_executing = false;
     cleanup_and_destroy(pg);
   }
@@ -982,6 +1036,14 @@ static PGquery *pg_query_init(PGconn *conn, Arena *arena, PGpool *pool) {
   pg->is_connected = (conn != NULL);
   pg->is_executing = false;
   pg->handle_initialized = false;
+  atomic_init(&pg->handle_closing, false);
+  pg->needs_close = false;
+  
+  if (uv_mutex_init(&pg->handle_mutex) != 0) {
+    LOG_ERROR("Failed to initialize handle mutex");
+    return NULL;
+  }
+  
   pg->query_queue = NULL;
   pg->query_queue_tail = NULL;
   pg->current_query = NULL;
@@ -991,6 +1053,8 @@ static PGquery *pg_query_init(PGconn *conn, Arena *arena, PGpool *pool) {
   pg->complete_data = NULL;
   pg->parallel = NULL;
   pg->parallel_index = -1;
+  pg->res = NULL;
+  pg->client = NULL;
 
 #ifdef _WIN32
   pg->timer.data = pg;
@@ -1071,30 +1135,36 @@ int pg_query_queue(PGquery *pg,
   return 0;
 }
 
-PGquery *pg_query_create(PGpool *pool, Arena *arena) {
+// TODO: malloc fallback
+PGquery *pg_query_create(PGpool *pool, Res *res) {
   if (!pool) {
-    LOG_ERROR("pg_query_async_create: pool is NULL");
+    LOG_ERROR("pg_query_create: pool is NULL");
     return NULL;
   }
 
-  bool arena_owned = false;
-  if (!arena) {
-    arena = arena_borrow();
-    if (!arena) {
-      LOG_ERROR("pg_query_async_create: Failed to borrow arena");
-      return NULL;
-    }
-    arena_owned = true;
+  Arena *pg_arena = arena_borrow();
+  if (!pg_arena) {
+    LOG_ERROR("pg_query_create: Failed to borrow arena");
+    return NULL;
   }
 
-  PGquery *pg = pg_query_init(NULL, arena, pool);
+  PGquery *pg = pg_query_init(NULL, pg_arena, pool);
   if (!pg) {
-    if (arena_owned)
-      arena_return(arena);
+    arena_return(pg_arena);
     return NULL;
   }
 
-  pg->arena_owned = arena_owned;
+  pg->arena_owned = true;
+  
+  if (res && res->client_socket && res->client_socket->data) {
+    pg->res = res;
+    pg->client = (client_t *)res->client_socket->data;
+    client_ref(pg->client);
+  } else {
+    pg->res = NULL;
+    pg->client = NULL;
+  }
+
   return pg;
 }
 
@@ -1247,8 +1317,18 @@ static void on_parallel_stream_complete(PGquery *pg, void *data) {
   // Unlock before calling user callback
   uv_mutex_unlock(&parallel->mutex);
 
-  if (callback)
-    callback(parallel, 1, callback_data);
+  if (callback) {
+    if (parallel->client) {
+      if (client_is_valid(parallel->client)) {
+        callback(parallel, 1, callback_data);
+      } else {
+        LOG_DEBUG("Client closed before parallel completion");
+      }
+      client_unref(parallel->client);
+    } else {
+      callback(parallel, 1, callback_data);
+    }
+  }
 
   uv_mutex_destroy(&parallel->mutex);
 
@@ -1256,45 +1336,47 @@ static void on_parallel_stream_complete(PGquery *pg, void *data) {
     arena_return(arena);
 }
 
-PGparallel *pg_parallel_create(PGpool *pool, int count, Arena *arena) {
+PGparallel *pg_parallel_create(PGpool *pool, int count, Res *res) {
   if (!pool || count <= 0) {
     LOG_ERROR("pg_parallel_create: Invalid parameters");
     return NULL;
   }
 
-  bool arena_owned = false;
-
+  Arena *arena = arena_borrow();
   if (!arena) {
-    arena = arena_borrow();
-    if (!arena) {
-      LOG_ERROR("pg_parallel_create: Failed to borrow arena");
-      return NULL;
-    }
-    arena_owned = true;
+    LOG_ERROR("pg_parallel_create: Failed to borrow arena");
+    return NULL;
   }
 
   PGparallel *parallel = arena_alloc(arena, sizeof(PGparallel));
   if (!parallel) {
     LOG_ERROR("pg_parallel_create: Failed to allocate parallel context");
-    if (arena_owned)
-      arena_return(arena);
+    arena_return(arena);
     return NULL;
   }
 
   memset(parallel, 0, sizeof(PGparallel));
   parallel->pool = pool;
   parallel->arena = arena;
-  parallel->arena_owned = arena_owned;
+  parallel->arena_owned = true;
   parallel->count = count;
   parallel->completed = 0;
   parallel->started = 0;
   parallel->on_complete = NULL;
   parallel->complete_data = NULL;
 
+  if (res && res->client_socket && res->client_socket->data) {
+    parallel->res = res;
+    parallel->client = (client_t *)res->client_socket->data;
+    client_ref(parallel->client);
+  } else {
+    parallel->res = NULL;
+    parallel->client = NULL;
+  }
+
   if (uv_mutex_init(&parallel->mutex) != 0) {
     LOG_ERROR("pg_parallel_create: Failed to initialize mutex");
-    if (arena_owned)
-      arena_return(arena);
+    arena_return(arena);
     return NULL;
   }
 
@@ -1302,8 +1384,7 @@ PGparallel *pg_parallel_create(PGpool *pool, int count, Arena *arena) {
   if (!parallel->streams) {
     LOG_ERROR("pg_parallel_create: Failed to allocate streams array");
     uv_mutex_destroy(&parallel->mutex);
-    if (arena_owned)
-      arena_return(arena);
+    arena_return(arena);
     return NULL;
   }
 
@@ -1311,8 +1392,7 @@ PGparallel *pg_parallel_create(PGpool *pool, int count, Arena *arena) {
   if (!parallel->conns) {
     LOG_ERROR("pg_parallel_create: Failed to allocate conns array");
     uv_mutex_destroy(&parallel->mutex);
-    if (arena_owned)
-      arena_return(arena);
+    arena_return(arena);
     return NULL;
   }
 

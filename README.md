@@ -100,7 +100,7 @@ static void on_users(PGquery *pg, PGresult *result, void *data) {
 
 // Route handler
 static void get_users(Req *req, Res *res) {
-    PGquery *pg = pg_query_create(pool, req->arena);
+    PGquery *pg = pg_query_create(pool, res);
     
     pg_query_queue(pg, "SELECT name FROM users ORDER BY name",
                    0, NULL, on_users, res);
@@ -243,7 +243,7 @@ static void pool_status(Req *req, Res *res) {
     PGPoolStats stats;
     pg_pool_get_stats(pool, &stats);
     
-    char *text = arena_sprintf(req->arena,
+    char *text = arena_sprintf(res->arena,
         "total: %d, available: %d, in_use: %d",
         stats.total, stats.available, stats.in_use
     );
@@ -291,24 +291,42 @@ set_interval(cleanup_callback, 15 * 60 * 1000, pool);
 
 Creates a query context for executing queries.
 ```c
-PGquery *pg_query_create(PGpool *pool, Arena *arena);
+PGquery *pg_query_create(PGpool *pool, Res *res);
 ```
 
 **Parameters:**
 - `pool` - Connection pool
-- `arena` - Memory arena (use `res->arena`, your custom arena or `NULL` to auto-borrow a new one)
+- `res` - Response object (or `NULL` for non-HTTP usage)
 
 **Returns:** Query handle or `NULL` on failure
 
-**Example:**
+**How it works:**
+- Library automatically borrows its own arena for the query lifecycle
+- If `res` is provided, tracks the client connection via ref-counting
+- Prevents crashes if client disconnects during async query execution
+- Automatically cleans up resources when query completes
+
+**Example (HTTP handler):**
 ```c
 static void handler(Req *req, Res *res) {
-    // Recommended: use request arena
-    PGquery *pg = pg_query_create(pool, res->arena);
+    PGquery *pg = pg_query_create(pool, res);
     
-    // Alternative: auto-borrow (library manages arena)
-    // PGquery *pg = pg_query_create(pool, NULL);
+    // Allocate context data in request arena
+    my_ctx_t *ctx = arena_alloc(req->arena, sizeof(my_ctx_t));
+    ctx->res = res;
+    
+    pg_query_queue(pg, "SELECT * FROM users", 0, NULL, callback, ctx);
+    pg_query_exec(pg);
 }
+```
+
+**Example (non-HTTP usage - background jobs, CLI tools):**
+```c
+// Pass NULL when not in HTTP request context
+PGquery *pg = pg_query_create(pool, NULL);
+pg_query_queue(pg, "DELETE FROM old_logs WHERE created_at < NOW() - INTERVAL '30 days'",
+               0, NULL, NULL, NULL);
+pg_query_exec(pg);
 ```
 
 ---
@@ -379,7 +397,7 @@ int pg_query_exec(PGquery *pg);
 
 **Example:**
 ```c
-PGquery *pg = pg_query_create(pool, req->arena);
+PGquery *pg = pg_query_create(pool, res);
 
 pg_query_queue(pg, "SELECT * FROM products",
                0, NULL, on_products, res);
@@ -413,7 +431,7 @@ static void on_complete(PGquery *pg, void *data) {
     send_text(res, OK, "All queries completed");
 }
 
-PGquery *pg = pg_query_create(pool, req->arena);
+PGquery *pg = pg_query_create(pool, res);
 pg_query_on_complete(pg, on_complete, res);
 pg_query_queue(pg, "SELECT * FROM users", 0, NULL, on_users, res);
 pg_query_exec(pg);
@@ -447,7 +465,7 @@ static void transfer_money(Req *req, Res *res) {
     const char *to_id = "2";
     const char *amount = "100.00";
     
-    PGquery *pg = pg_query_create(pool, req->arena);
+    PGquery *pg = pg_query_create(pool, res);
     
     // Deduct from sender
     const char *debit_params[] = { amount, from_id };
@@ -495,13 +513,13 @@ Execute multiple independent queries concurrently using separate connections.
 
 Creates a parallel query context.
 ```c
-PGparallel *pg_parallel_create(PGpool *pool, int count, Arena *arena);
+PGparallel *pg_parallel_create(PGpool *pool, int count, Res *res);
 ```
 
 **Parameters:**
 - `pool` - Connection pool
 - `count` - Number of parallel streams
-- `arena` - Memory arena (use `req->arena` or `NULL`)
+- `res` - Response object (or `NULL` for non-HTTP usage)
 
 **Returns:** Parallel context or `NULL` on failure
 
@@ -595,7 +613,7 @@ static void on_user(PGquery *pg, PGresult *result, void *data) {
 static void get_user(Req *req, Res *res) {
     const char *id = get_param(req, "id");
     
-    PGquery *pg = pg_query_create(pool, req->arena);
+    PGquery *pg = pg_query_create(pool, res);
     
     const char *params[] = { id };
     pg_query_queue(pg,
@@ -654,7 +672,7 @@ static void create_user(Req *req, Res *res) {
     const char *name = "John Doe";
     const char *email = "john@example.com";
     
-    PGquery *pg = pg_query_create(pool, req->arena);
+    PGquery *pg = pg_query_create(pool, res);
     
     const char *params[] = { name, email };
     pg_query_queue(pg,
@@ -766,7 +784,7 @@ static void get_user_profile(Req *req, Res *res) {
     profile_ctx_t *ctx = arena_alloc(req->arena, sizeof(profile_ctx_t));
     ctx->res = res;
     
-    PGquery *pg = pg_query_create(pool, req->arena);
+    PGquery *pg = pg_query_create(pool, res);
     
     const char *params[] = { user_id };
     
@@ -868,7 +886,7 @@ static void create_user_with_post(Req *req, Res *res) {
     chain_ctx_t *ctx = arena_alloc(req->arena, sizeof(chain_ctx_t));
     ctx->res = res;
     
-    PGquery *pg = pg_query_create(pool, req->arena);
+    PGquery *pg = pg_query_create(pool, res);
     
     const char *params[] = { "John Doe", "john@example.com" };
     pg_query_queue(pg,
@@ -929,6 +947,79 @@ int main(void) {
 }
 ```
 
+### Transaction Example
+
+```c
+#include "ecewo.h"
+#include "ecewo-postgres.h"
+
+static PGpool *pool = NULL;
+
+static void on_transfer_complete(PGquery *pg, PGresult *result, void *data) {
+    Res *res = (Res *)data;
+    
+    ExecStatusType status = PQresultStatus(result);
+    if (status != PGRES_COMMAND_OK) {
+        send_json(res, INTERNAL_SERVER_ERROR,
+                 "{\"error\":\"Transfer failed\"}");
+        return;
+    }
+    
+    send_json(res, OK, "{\"status\":\"transferred\"}");
+}
+
+static void transfer_money(Req *req, Res *res) {
+    const char *from_id = get_param(req, "from");
+    const char *to_id = get_param(req, "to");
+    const char *amount = get_param(req, "amount");
+    
+    PGquery *pg = pg_query_create(pool, res);
+    
+    // Deduct from sender
+    const char *debit_params[] = { amount, from_id };
+    pg_query_queue(pg,
+        "UPDATE accounts SET balance = balance - $1 WHERE id = $2",
+        2, debit_params, NULL, NULL);
+    
+    // Add to receiver
+    const char *credit_params[] = { amount, to_id };
+    pg_query_queue(pg,
+        "UPDATE accounts SET balance = balance + $1 WHERE id = $2",
+        2, credit_params, on_transfer_complete, res);
+    
+    // Execute as transaction
+    pg_query_exec_trans(pg);
+}
+
+void cleanup(void) {
+    pg_pool_destroy(pool);
+}
+
+int main(void) {
+    server_init();
+    
+    PGPoolConfig config = {
+        .host = "localhost",
+        .port = "5432",
+        .dbname = "mydb",
+        .user = "postgres",
+        .password = "secret",
+        .pool_size = 10,
+        .timeout_ms = 5000
+    };
+    
+    pool = pg_pool_create(&config);
+    
+    post("/transfer", transfer_money);
+    
+    server_atexit(cleanup);
+    server_listen(3000);
+    server_run();
+    
+    return 0;
+}
+```
+
 ### Parallel Querying Example
 
 ```c
@@ -981,7 +1072,7 @@ static void get_stats(Req *req, Res *res) {
     ctx->res = res;
     
     // Create parallel context with 3 streams
-    PGparallel *parallel = pg_parallel_create(pool, 3, req->arena);
+    PGparallel *parallel = pg_parallel_create(pool, 3, res);
     
     // Stream 0: Count users
     PGquery *pg0 = pg_parallel_get(parallel, 0);
@@ -1051,14 +1142,14 @@ int main(void) {
 
 ### 1. Always Use Parameterized Queries
 
-**DO NOT DO THIS**
+**DO NOT DO THIS:**
 ```c
 char sql[256];
 sprintf(sql, "SELECT * FROM users WHERE email = '%s'", email);
 pg_query_queue(pg, sql, 0, NULL, on_result, NULL);
 ```
 
-**DO THIS**
+**DO THIS:**
 ```c
 const char *params[] = { email };
 pg_query_queue(pg, "SELECT * FROM users WHERE email = $1",
@@ -1067,13 +1158,13 @@ pg_query_queue(pg, "SELECT * FROM users WHERE email = $1",
 
 ---
 
-### 2. Use Request Arena for Query Context
+### 2. Pass Response Object to pg_query_create
 
-**Recommended:**
+**Recommended (HTTP handlers):**
 ```c
 static void handler(Req *req, Res *res) {
-    // Pass request arena - automatically cleaned up after response
-    PGquery *pg = pg_query_create(pool, req->arena);
+    // Pass res - library manages arena and client lifecycle automatically
+    PGquery *pg = pg_query_create(pool, res);
     
     // Allocate context in request arena
     my_ctx_t *ctx = arena_alloc(req->arena, sizeof(my_ctx_t));
@@ -1084,9 +1175,11 @@ static void handler(Req *req, Res *res) {
 }
 ```
 
-> [!NOTE]
-> 
-> If you're working with a custom arena outside of handler, you can pass that arena directly. Use `NULL` only if you need the library to create a new arena and auto-manage it for having more basic usage. But it's better to do everything in a specific arena of yours, no matter you created it or handler gave it to you. See the [arena integration chapter](#arena-integration).
+**For non-HTTP usage:**
+```c
+// Background jobs, CLI tools, etc.
+PGquery *pg = pg_query_create(pool, NULL);
+```
 
 ---
 
@@ -1116,19 +1209,18 @@ static void on_result(PGquery *pg, PGresult *result, void *data) {
 
 **DO NOT DO THIS:**
 ```c
-// Separate executions - not atomic!
-PGquery *pg1 = pg_query_create(pool, req->arena);
+PGquery *pg1 = pg_query_create(pool, res);
 pg_query_queue(pg1, "UPDATE table1 ...", ...);
 pg_query_exec(pg1);
 
-PGquery *pg2 = pg_query_create(pool, req->arena);
+PGquery *pg2 = pg_query_create(pool, res);
 pg_query_queue(pg2, "UPDATE table2 ...", ...);
 pg_query_exec(pg2);
 ```
 
 **DO THIS:**
 ```c
-PGquery *pg = pg_query_create(pool, req->arena);
+PGquery *pg = pg_query_create(pool, res);
 
 pg_query_queue(pg, "UPDATE table1 ...", 2, params1, NULL, NULL);
 pg_query_queue(pg, "UPDATE table2 ...", 2, params2, NULL, NULL);
@@ -1226,7 +1318,7 @@ static void on_complete(PGquery *pg, void *data) {
     // Normal completion
 }
 
-PGquery *pg = pg_query_create(pool, req->arena);
+PGquery *pg = pg_query_create(pool, res);
 pg_query_on_complete(pg, on_complete, res);
 pg_query_queue(pg, "SELECT * FROM users", 0, NULL, on_users, res);
 pg_query_exec(pg);
@@ -1238,29 +1330,36 @@ pg_query_exec(pg);
 
 ### Arena Integration
 
-ecewo-postgres integrates seamlessly with ecewo's arena allocator:
+ecewo-postgres manages its own arena lifecycle automatically:
 
-**Recommended - Request Arena:**
+**HTTP Handlers:**
 ```c
 static void handler(Req *req, Res *res) {
-    // Use request arena - cleaned up automatically after response
-    PGquery *pg = pg_query_create(pool, req->arena);
+    // Pass res - library borrows its own arena internally
+    PGquery *pg = pg_query_create(pool, res);
+    
+    // Allocate context data in request arena
+    my_ctx_t *ctx = arena_alloc(req->arena, sizeof(my_ctx_t));
+    ctx->res = res;
+    
+    pg_query_queue(pg, "SELECT * FROM users", 0, NULL, callback, ctx);
+    pg_query_exec(pg);
 }
 ```
 
-**Alternative - Auto-borrow:**
-```c
-// Library borrows and returns arena automatically
-PGquery *pg = pg_query_create(pool, NULL);
-```
+**How it works:**
+1. Library borrows its own arena for `PGquery` lifecycle
+2. Library tracks client connection via ref-counting
+3. Even if client disconnects during async query, no crash occurs
+4. Arena and resources are cleaned up when query completes
 
-**Advanced - Custom Arena:**
+**Non-HTTP Usage:**
 ```c
-// Manage arena yourself
-Arena *arena = arena_borrow();
-PGquery *pg = pg_query_create(pool, arena);
-// ... use pg ...
-// Arena returned automatically when queries complete
+// Pass NULL for res when not in HTTP context
+PGquery *pg = pg_query_create(pool, NULL);
+pg_query_queue(pg, "DELETE FROM old_logs WHERE created_at < $1",
+               1, params, NULL, NULL);
+pg_query_exec(pg);
 ```
 
 ---
@@ -1272,10 +1371,10 @@ PGquery *pg = pg_query_create(pool, arena);
 3. Connection acquired from pool (callback-based)
 4. Queries executed sequentially
 5. Connection automatically returned to pool
-6. Arena freed (if owned by library)
+6. Arena freed automatically by library
 ```
 
-If you use `req->arena` or `res->arena`, it will be automatically freed anyway after the response is sent.
+Request/response arenas (`req->arena`, `res->arena`) are freed automatically after the response is sent.
 
 ---
 
@@ -1330,7 +1429,7 @@ static void handler(Req *req, Res *res) {
 
 **Good - One connection:**
 ```c
-PGquery *pg = pg_query_create(pool, req->arena);
+PGquery *pg = pg_query_create(pool, res);
 pg_query_queue(pg, "SELECT * FROM users WHERE id = $1", ...);
 pg_query_queue(pg, "SELECT * FROM posts WHERE user_id = $1", ...);
 pg_query_queue(pg, "SELECT COUNT(*) FROM comments WHERE user_id = $1", ...);
@@ -1340,11 +1439,11 @@ pg_query_exec(pg);  // Uses one connection
 **Less efficient - Multiple connections:**
 ```c
 // Each execution acquires a separate connection
-PGquery *pg1 = pg_query_create(pool, req->arena);
+PGquery *pg1 = pg_query_create(pool, res);
 pg_query_queue(pg1, "SELECT * FROM users ...", ...);
 pg_query_exec(pg1);  // Connection 1
 
-PGquery *pg2 = pg_query_create(pool, req->arena);
+PGquery *pg2 = pg_query_create(pool, res);
 pg_query_queue(pg2, "SELECT * FROM posts ...", ...);
 pg_query_exec(pg2);  // Connection 2 (unnecessary)
 ```
@@ -1359,7 +1458,7 @@ pg_query_exec(pg2);  // Connection 2 (unnecessary)
 
 **Parallel execution:**
 ```c
-PGparallel *parallel = pg_parallel_create(pool, 3, req->arena);
+PGparallel *parallel = pg_parallel_create(pool, 3, res);
 
 PGquery *pg0 = pg_parallel_get(parallel, 0);
 pg_query_queue(pg0, "SELECT FROM table1 ...", ...);
@@ -1375,7 +1474,7 @@ pg_parallel_exec(parallel);  // All execute concurrently
 
 **Sequential execution is slower:**
 ```c
-PGquery *pg = pg_query_create(pool, req->arena);
+PGquery *pg = pg_query_create(pool, res);
 pg_query_queue(pg, "SELECT FROM table1 ...", ...);
 pg_query_queue(pg, "SELECT FROM table2 ...", ...);
 pg_query_queue(pg, "SELECT FROM table3 ...", ...);
