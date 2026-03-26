@@ -166,10 +166,7 @@ typedef struct {
     const char *user;      // Username
     const char *password;  // Password
     int pool_size;         // Number of connections (1-1024)
-    int timeout_ms;        // Acquisition timeout
-                           // 0 = fail immediately if pool exhausted
-                           // >0 = wait up to N milliseconds
-                           // -1 = wait indefinitely
+    int timeout_ms;        // 0 = no wait, -1 = infinite, >0 = wait up to N milliseconds
 } PGPoolConfig;
 ```
 
