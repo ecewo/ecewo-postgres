@@ -17,6 +17,10 @@
 #define LOG_ERROR(fmt, ...) \
   fprintf(stderr, "[ERROR] [ecewo-postgres] " fmt "\n", ##__VA_ARGS__)
 
+static inline uv_loop_t *pg_loop(void) {
+  return (uv_loop_t *)ecewo_get_loop();
+}
+
 struct pg_query_s {
   char *sql;
   char **params;
@@ -28,7 +32,7 @@ struct pg_query_s {
 
 struct pg_async_s {
   PGconn *conn;
-  Arena *arena;
+  ecewo_arena_t *arena;
   void *data;
 
   bool is_connected;
@@ -53,9 +57,9 @@ struct pg_async_s {
   bool needs_close;  // Flag to defer close
   uv_mutex_t handle_mutex;
 
-  Res *res;
-  client_t *client;
-  
+  ecewo_response_t *res;
+  ecewo_client_t *client;
+
 #ifdef _WIN32
   uv_timer_t timer;
 #else
@@ -78,6 +82,7 @@ typedef struct pool_wait_s {
 } pool_wait_t;
 
 struct pg_pool_s {
+  ecewo_app_t *app;
   pool_connection_t *connections;
   uint16_t size;
   int timeout_ms;
@@ -91,7 +96,7 @@ struct pg_pool_s {
 
 struct pg_parallel_s {
   PGpool *pool;
-  Arena *arena;
+  ecewo_arena_t *arena;
   bool arena_owned;
   PGquery **streams;
   PGconn **conns;
@@ -101,8 +106,8 @@ struct pg_parallel_s {
   pg_parallel_cb_t on_complete;
   void *complete_data;
   uv_mutex_t mutex;
-  Res *res;
-  client_t *client;
+  ecewo_response_t *res;
+  ecewo_client_t *client;
 };
 
 typedef struct {
@@ -168,7 +173,7 @@ static void on_pool_timeout(uv_timer_t *handle) {
   }
 
   uv_mutex_unlock(&ctx->pool->mutex);
-  decrement_async_work();
+  ecewo_decrement_async_work();
 
   ctx->waiter->callback(NULL, ctx->waiter->data);
   free(ctx->waiter);
@@ -200,6 +205,7 @@ typedef struct {
   uv_poll_t poll;
   void (*callback)(PGconn *conn, void *data);
   void *data;
+  ecewo_app_t *app;
 } async_reset_ctx_t;
 
 static void on_reset_ready(uv_poll_t *handle, int status, int events) {
@@ -208,7 +214,7 @@ static void on_reset_ready(uv_poll_t *handle, int status, int events) {
 
   async_reset_ctx_t *ctx = handle->data;
 
-  if (!server_is_running()) {
+  if (!ecewo_is_running(ctx->app)) {
     uv_poll_stop(&ctx->poll);
     ctx->callback(NULL, ctx->data);
     free(ctx);
@@ -250,6 +256,7 @@ static void on_reset_ready(uv_poll_t *handle, int status, int events) {
 }
 
 static void pg_async_reset(PGconn *conn,
+                           ecewo_app_t *app,
                            void (*callback)(PGconn *, void *),
                            void *data) {
   if (!PQresetStart(conn)) {
@@ -266,9 +273,10 @@ static void pg_async_reset(PGconn *conn,
   ctx->conn = conn;
   ctx->callback = callback;
   ctx->data = data;
+  ctx->app = app;
 
   int sock = PQsocket(conn);
-  if (uv_poll_init(get_loop(), &ctx->poll, sock) != 0) {
+  if (uv_poll_init(pg_loop(), &ctx->poll, sock) != 0) {
     free(ctx);
     callback(NULL, data);
     return;
@@ -305,6 +313,11 @@ PGpool *pg_pool_create(PGPoolConfig *config) {
     return NULL;
   }
 
+  if (!config->app) {
+    LOG_ERROR("Pool configuration requires a non-NULL ecewo_app_t *app");
+    return NULL;
+  }
+
   PGpool *pool = malloc(sizeof(PGpool));
   if (!pool) {
     LOG_ERROR("Failed to allocate pool");
@@ -313,6 +326,7 @@ PGpool *pg_pool_create(PGPoolConfig *config) {
 
   memset(pool, 0, sizeof(PGpool));
 
+  pool->app = config->app;
   pool->conninfo = build_conninfo(config);
   if (!pool->conninfo) {
     free(pool);
@@ -413,7 +427,7 @@ typedef struct {
 
 static void on_connection_reset_for_borrow(PGconn *conn, void *data) {
   reset_and_return_ctx_t *ctx = data;
-  decrement_async_work();
+  ecewo_decrement_async_work();
 
   if (!conn) {
     // Reset failed, mark connection as dead
@@ -467,7 +481,7 @@ static PGconn *pg_pool_borrow_internal(PGpool *pool,
 
           pool->connections[i].in_use = true;
           uv_mutex_unlock(&pool->mutex);
-          pg_async_reset(conn, on_connection_reset_for_borrow, reset_ctx);
+          pg_async_reset(conn, pool->app, on_connection_reset_for_borrow, reset_ctx);
           uv_mutex_lock(&pool->mutex);
         }
 
@@ -506,13 +520,13 @@ static void pg_pool_request(PGpool *pool,
     return;
   }
 
-  increment_async_work();
+  ecewo_increment_async_work();
 
   uv_mutex_lock(&pool->mutex);
 
   if (pool->destroyed) {
     uv_mutex_unlock(&pool->mutex);
-    decrement_async_work();
+    ecewo_decrement_async_work();
     callback(NULL, data);
     return;
   }
@@ -527,7 +541,7 @@ static void pg_pool_request(PGpool *pool,
 
   if (conn) {
     uv_mutex_unlock(&pool->mutex);
-    decrement_async_work();
+    ecewo_decrement_async_work();
     callback(conn, data);
     return;
   }
@@ -562,7 +576,7 @@ static void pg_pool_request(PGpool *pool,
         timeout_ctx->pool = pool;
         timeout_ctx->waiter = waiter;
 
-        if (uv_timer_init(get_loop(), waiter->timeout_timer) == 0) {
+        if (uv_timer_init(pg_loop(), waiter->timeout_timer) == 0) {
           waiter->timeout_timer->data = timeout_ctx;
           uv_timer_start(waiter->timeout_timer, on_pool_timeout,
                          pool->timeout_ms, 0);
@@ -626,7 +640,7 @@ void pg_pool_return(PGpool *pool, PGconn *conn) {
 
     uv_mutex_unlock(&pool->mutex);
 
-    decrement_async_work();
+    ecewo_decrement_async_work();
     waiter->callback(conn, waiter->data);
     free(waiter);
     return;
@@ -695,18 +709,18 @@ static void on_handle_closed(uv_handle_t *handle) {
     return;
 
   PGquery *pg = (PGquery *)handle->data;
-  
+
   if (pg->pool && pg->conn)
     pg_pool_return(pg->pool, pg->conn);
 
   if (pg->on_complete) {
     if (pg->client) {
-      if (client_is_valid(pg->client)) {
+      if (ecewo_client_is_valid(pg->client)) {
         pg->on_complete(pg, pg->complete_data);
       } else {
         LOG_DEBUG("Client closed before query completion");
       }
-      client_unref(pg->client);
+      ecewo_client_unref(pg->client);
       pg->client = NULL;
     } else {
       pg->on_complete(pg, pg->complete_data);
@@ -716,7 +730,7 @@ static void on_handle_closed(uv_handle_t *handle) {
   uv_mutex_destroy(&pg->handle_mutex);
 
   if (pg->arena_owned && pg->arena && !pg->parallel)
-    arena_return(pg->arena);
+    ecewo_arena_return(pg->arena);
 }
 
 static void cancel_execution(PGquery *pg) {
@@ -724,10 +738,10 @@ static void cancel_execution(PGquery *pg) {
     return;
 
   uv_mutex_lock(&pg->handle_mutex);
-  
+
   if (pg->needs_close && pg->handle_initialized && !atomic_load(&pg->handle_closing)) {
     atomic_store(&pg->handle_closing, true);
-    
+
 #ifdef _WIN32
     uv_timer_stop(&pg->timer);
     if (!uv_is_closing((uv_handle_t *)&pg->timer)) {
@@ -740,7 +754,7 @@ static void cancel_execution(PGquery *pg) {
     }
 #endif
   }
-  
+
   uv_mutex_unlock(&pg->handle_mutex);
 
   if (pg->conn && pg->is_executing) {
@@ -760,19 +774,19 @@ static void cleanup_and_destroy(PGquery *pg) {
     return;
 
   cancel_execution(pg);
-  
+
   if (!pg->handle_initialized) {
     if (pg->pool && pg->conn)
       pg_pool_return(pg->pool, pg->conn);
 
     if (pg->on_complete) {
       if (pg->client) {
-        if (client_is_valid(pg->client)) {
+        if (ecewo_client_is_valid(pg->client)) {
           pg->on_complete(pg, pg->complete_data);
         } else {
           LOG_ERROR("Client closed before query completion");
         }
-        client_unref(pg->client);
+        ecewo_client_unref(pg->client);
         pg->client = NULL;
       } else {
         pg->on_complete(pg, pg->complete_data);
@@ -782,7 +796,7 @@ static void cleanup_and_destroy(PGquery *pg) {
     uv_mutex_destroy(&pg->handle_mutex);
 
     if (pg->arena_owned && pg->arena && !pg->parallel)
-      arena_return(pg->arena);
+      ecewo_arena_return(pg->arena);
   }
 }
 
@@ -798,7 +812,7 @@ static void on_timer(uv_timer_t *handle) {
 
   PGquery *pg = (PGquery *)handle->data;
 
-  if (!server_is_running()) {
+  if (!ecewo_is_running(pg->pool ? pg->pool->app : NULL)) {
     uv_timer_stop(&pg->timer);
     pg->needs_close = true;
     pg->is_executing = false;
@@ -860,7 +874,7 @@ static void on_poll(uv_poll_t *handle, int status, int events) {
 
   PGquery *pg = (PGquery *)handle->data;
 
-  if (!server_is_running()) {
+  if (!ecewo_is_running(pg->pool ? pg->pool->app : NULL)) {
     uv_poll_stop(&pg->poll);
     pg->needs_close = true;
     pg->is_executing = false;
@@ -932,7 +946,7 @@ static void execute_next_query(PGquery *pg) {
     return;
   }
 
-  if (!server_is_running()) {
+  if (!ecewo_is_running(pg->pool ? pg->pool->app : NULL)) {
     pg->is_executing = false;
     cleanup_and_destroy(pg);
     return;
@@ -967,7 +981,7 @@ static void execute_next_query(PGquery *pg) {
 
 #ifdef _WIN32
   if (!pg->handle_initialized) {
-    int init_result = uv_timer_init(get_loop(), &pg->timer);
+    int init_result = uv_timer_init(pg_loop(), &pg->timer);
     if (init_result != 0) {
       LOG_ERROR("uv_timer_init failed: %s", uv_strerror(init_result));
       handle_query_error(pg);
@@ -993,7 +1007,7 @@ static void execute_next_query(PGquery *pg) {
   }
 
   if (!pg->handle_initialized) {
-    int init_result = uv_poll_init(get_loop(), &pg->poll, sock);
+    int init_result = uv_poll_init(pg_loop(), &pg->poll, sock);
     if (init_result != 0) {
       LOG_ERROR("uv_poll_init failed: %s", uv_strerror(init_result));
       handle_query_error(pg);
@@ -1013,7 +1027,7 @@ static void execute_next_query(PGquery *pg) {
 #endif
 }
 
-static PGquery *pg_query_init(PGconn *conn, Arena *arena, PGpool *pool) {
+static PGquery *pg_query_init(PGconn *conn, ecewo_arena_t *arena, PGpool *pool) {
   if (!arena) {
     LOG_ERROR("pg_query_init: arena is NULL");
     return NULL;
@@ -1024,7 +1038,7 @@ static PGquery *pg_query_init(PGconn *conn, Arena *arena, PGpool *pool) {
     return NULL;
   }
 
-  PGquery *pg = arena_alloc(arena, sizeof(PGquery));
+  PGquery *pg = ecewo_alloc(arena, sizeof(PGquery));
   if (!pg) {
     LOG_ERROR("pg_query_init: Failed to allocate from arena");
     return NULL;
@@ -1038,12 +1052,12 @@ static PGquery *pg_query_init(PGconn *conn, Arena *arena, PGpool *pool) {
   pg->handle_initialized = false;
   atomic_init(&pg->handle_closing, false);
   pg->needs_close = false;
-  
+
   if (uv_mutex_init(&pg->handle_mutex) != 0) {
     LOG_ERROR("Failed to initialize handle mutex");
     return NULL;
   }
-  
+
   pg->query_queue = NULL;
   pg->query_queue_tail = NULL;
   pg->current_query = NULL;
@@ -1084,7 +1098,7 @@ int pg_query_queue(PGquery *pg,
     return -1;
   }
 
-  pg_query_t *query = arena_alloc(pg->arena, sizeof(pg_query_t));
+  pg_query_t *query = ecewo_alloc(pg->arena, sizeof(pg_query_t));
   if (!query) {
     LOG_ERROR("pg_query_queue: Failed to allocate query");
     return -1;
@@ -1093,14 +1107,14 @@ int pg_query_queue(PGquery *pg,
   memset(query, 0, sizeof(pg_query_t));
   query->next = NULL;
 
-  query->sql = arena_strdup(pg->arena, sql);
+  query->sql = ecewo_strdup(pg->arena, sql);
   if (!query->sql) {
     LOG_ERROR("pg_query_queue: Failed to copy SQL");
     return -1;
   }
 
   if (param_count > 0 && params) {
-    query->params = arena_alloc(pg->arena, param_count * sizeof(char *));
+    query->params = ecewo_alloc(pg->arena, param_count * sizeof(char *));
     if (!query->params) {
       LOG_ERROR("pg_query_queue: Failed to allocate params");
       return -1;
@@ -1108,7 +1122,7 @@ int pg_query_queue(PGquery *pg,
 
     for (int i = 0; i < param_count; i++) {
       if (params[i]) {
-        query->params[i] = arena_strdup(pg->arena, params[i]);
+        query->params[i] = ecewo_strdup(pg->arena, params[i]);
         if (!query->params[i]) {
           LOG_ERROR("pg_query_queue: Failed to allocate a param");
           return -1;
@@ -1136,13 +1150,13 @@ int pg_query_queue(PGquery *pg,
 }
 
 // TODO: malloc fallback
-PGquery *pg_query_create(PGpool *pool, Res *res) {
+PGquery *pg_query_create(PGpool *pool, ecewo_response_t *res) {
   if (!pool) {
     LOG_ERROR("pg_query_create: pool is NULL");
     return NULL;
   }
 
-  Arena *pg_arena = arena_borrow();
+  ecewo_arena_t *pg_arena = ecewo_arena_borrow();
   if (!pg_arena) {
     LOG_ERROR("pg_query_create: Failed to borrow arena");
     return NULL;
@@ -1150,16 +1164,17 @@ PGquery *pg_query_create(PGpool *pool, Res *res) {
 
   PGquery *pg = pg_query_init(NULL, pg_arena, pool);
   if (!pg) {
-    arena_return(pg_arena);
+    ecewo_arena_return(pg_arena);
     return NULL;
   }
 
   pg->arena_owned = true;
-  
-  if (res && res->client_socket && res->client_socket->data) {
+
+  ecewo_client_t *client = ecewo_res_client(res);
+  if (client) {
     pg->res = res;
-    pg->client = (client_t *)res->client_socket->data;
-    client_ref(pg->client);
+    pg->client = client;
+    ecewo_client_ref(pg->client);
   } else {
     pg->res = NULL;
     pg->client = NULL;
@@ -1171,9 +1186,9 @@ PGquery *pg_query_create(PGpool *pool, Res *res) {
 static void on_connection_acquired_for_query(PGconn *conn, void *data) {
   PGquery *pg = data;
 
-  decrement_async_work();
+  ecewo_decrement_async_work();
 
-  if (!server_is_running()) {
+  if (!ecewo_is_running(pg->pool ? pg->pool->app : NULL)) {
     if (conn && pg->pool)
       pg_pool_return(pg->pool, conn);
 
@@ -1181,7 +1196,7 @@ static void on_connection_acquired_for_query(PGconn *conn, void *data) {
       pg->on_complete(NULL, pg->complete_data);
 
     if (pg->arena_owned && pg->arena)
-      arena_return(pg->arena);
+      ecewo_arena_return(pg->arena);
 
     return;
   }
@@ -1193,7 +1208,7 @@ static void on_connection_acquired_for_query(PGconn *conn, void *data) {
       pg->on_complete(NULL, pg->complete_data);
 
     if (pg->arena_owned && pg->arena)
-      arena_return(pg->arena);
+      ecewo_arena_return(pg->arena);
 
     return;
   }
@@ -1221,7 +1236,7 @@ int pg_query_exec(PGquery *pg) {
     return 0;
   }
 
-  increment_async_work();
+  ecewo_increment_async_work();
 
   pg_pool_request(pg->pool, on_connection_acquired_for_query, pg);
 
@@ -1244,14 +1259,14 @@ int pg_query_exec_trans(PGquery *pg) {
     return 0;
   }
 
-  pg_query_t *begin_query = arena_alloc(pg->arena, sizeof(pg_query_t));
+  pg_query_t *begin_query = ecewo_alloc(pg->arena, sizeof(pg_query_t));
   if (!begin_query) {
     LOG_ERROR("pg_query_exec_trans_async: Failed to allocate BEGIN query");
     return -1;
   }
 
   memset(begin_query, 0, sizeof(pg_query_t));
-  begin_query->sql = arena_strdup(pg->arena, "BEGIN");
+  begin_query->sql = ecewo_strdup(pg->arena, "BEGIN");
   if (!begin_query->sql) {
     LOG_ERROR("pg_query_exec_trans_async: Failed to copy BEGIN SQL");
     return -1;
@@ -1263,14 +1278,14 @@ int pg_query_exec_trans(PGquery *pg) {
   begin_query->next = pg->query_queue;
   pg->query_queue = begin_query;
 
-  pg_query_t *commit_query = arena_alloc(pg->arena, sizeof(pg_query_t));
+  pg_query_t *commit_query = ecewo_alloc(pg->arena, sizeof(pg_query_t));
   if (!commit_query) {
     LOG_ERROR("pg_query_exec_trans_async: Failed to allocate COMMIT query");
     return -1;
   }
 
   memset(commit_query, 0, sizeof(pg_query_t));
-  commit_query->sql = arena_strdup(pg->arena, "COMMIT");
+  commit_query->sql = ecewo_strdup(pg->arena, "COMMIT");
   if (!commit_query->sql) {
     LOG_ERROR("pg_query_exec_trans_async: Failed to copy COMMIT SQL");
     return -1;
@@ -1312,19 +1327,19 @@ static void on_parallel_stream_complete(PGquery *pg, void *data) {
   pg_parallel_cb_t callback = parallel->on_complete;
   void *callback_data = parallel->complete_data;
   bool arena_owned = parallel->arena_owned;
-  Arena *arena = parallel->arena;
+  ecewo_arena_t *arena = parallel->arena;
 
   // Unlock before calling user callback
   uv_mutex_unlock(&parallel->mutex);
 
   if (callback) {
     if (parallel->client) {
-      if (client_is_valid(parallel->client)) {
+      if (ecewo_client_is_valid(parallel->client)) {
         callback(parallel, 1, callback_data);
       } else {
         LOG_DEBUG("Client closed before parallel completion");
       }
-      client_unref(parallel->client);
+      ecewo_client_unref(parallel->client);
     } else {
       callback(parallel, 1, callback_data);
     }
@@ -1333,25 +1348,25 @@ static void on_parallel_stream_complete(PGquery *pg, void *data) {
   uv_mutex_destroy(&parallel->mutex);
 
   if (arena_owned && arena)
-    arena_return(arena);
+    ecewo_arena_return(arena);
 }
 
-PGparallel *pg_parallel_create(PGpool *pool, int count, Res *res) {
+PGparallel *pg_parallel_create(PGpool *pool, int count, ecewo_response_t *res) {
   if (!pool || count <= 0) {
     LOG_ERROR("pg_parallel_create: Invalid parameters");
     return NULL;
   }
 
-  Arena *arena = arena_borrow();
+  ecewo_arena_t *arena = ecewo_arena_borrow();
   if (!arena) {
     LOG_ERROR("pg_parallel_create: Failed to borrow arena");
     return NULL;
   }
 
-  PGparallel *parallel = arena_alloc(arena, sizeof(PGparallel));
+  PGparallel *parallel = ecewo_alloc(arena, sizeof(PGparallel));
   if (!parallel) {
     LOG_ERROR("pg_parallel_create: Failed to allocate parallel context");
-    arena_return(arena);
+    ecewo_arena_return(arena);
     return NULL;
   }
 
@@ -1365,10 +1380,11 @@ PGparallel *pg_parallel_create(PGpool *pool, int count, Res *res) {
   parallel->on_complete = NULL;
   parallel->complete_data = NULL;
 
-  if (res && res->client_socket && res->client_socket->data) {
+  ecewo_client_t *client = ecewo_res_client(res);
+  if (client) {
     parallel->res = res;
-    parallel->client = (client_t *)res->client_socket->data;
-    client_ref(parallel->client);
+    parallel->client = client;
+    ecewo_client_ref(parallel->client);
   } else {
     parallel->res = NULL;
     parallel->client = NULL;
@@ -1376,23 +1392,23 @@ PGparallel *pg_parallel_create(PGpool *pool, int count, Res *res) {
 
   if (uv_mutex_init(&parallel->mutex) != 0) {
     LOG_ERROR("pg_parallel_create: Failed to initialize mutex");
-    arena_return(arena);
+    ecewo_arena_return(arena);
     return NULL;
   }
 
-  parallel->streams = arena_alloc(arena, count * sizeof(PGquery *));
+  parallel->streams = ecewo_alloc(arena, count * sizeof(PGquery *));
   if (!parallel->streams) {
     LOG_ERROR("pg_parallel_create: Failed to allocate streams array");
     uv_mutex_destroy(&parallel->mutex);
-    arena_return(arena);
+    ecewo_arena_return(arena);
     return NULL;
   }
 
-  parallel->conns = arena_alloc(arena, count * sizeof(PGconn *));
+  parallel->conns = ecewo_alloc(arena, count * sizeof(PGconn *));
   if (!parallel->conns) {
     LOG_ERROR("pg_parallel_create: Failed to allocate conns array");
     uv_mutex_destroy(&parallel->mutex);
-    arena_return(arena);
+    ecewo_arena_return(arena);
     return NULL;
   }
 
@@ -1413,7 +1429,7 @@ PGquery *pg_parallel_get(PGparallel *parallel, int index) {
   // Lazy initialization of stream
   // without connection, happens in worker thread
   if (!parallel->streams[index]) {
-    PGquery *pg = arena_alloc(parallel->arena, sizeof(PGquery));
+    PGquery *pg = ecewo_alloc(parallel->arena, sizeof(PGquery));
     if (!pg) {
       LOG_ERROR("pg_parallel_get: Failed to allocate query for stream %d", index);
       return NULL;
@@ -1466,11 +1482,11 @@ static void on_parallel_connection_ready(PGconn *conn, void *data) {
   PGparallel *parallel = ctx->parallel;
   int index = ctx->index;
 
-  decrement_async_work();
+  ecewo_decrement_async_work();
 
   free(ctx);
 
-  if (!server_is_running()) {
+  if (!ecewo_is_running(parallel->pool ? parallel->pool->app : NULL)) {
     if (conn && parallel->pool)
       pg_pool_return(parallel->pool, conn);
 
@@ -1484,7 +1500,7 @@ static void on_parallel_connection_ready(PGconn *conn, void *data) {
       uv_mutex_destroy(&parallel->mutex);
 
       if (parallel->arena_owned && parallel->arena)
-        arena_return(parallel->arena);
+        ecewo_arena_return(parallel->arena);
     }
     uv_mutex_unlock(&parallel->mutex);
     return;
@@ -1544,14 +1560,14 @@ int pg_parallel_exec(PGparallel *parallel) {
     uv_mutex_destroy(&parallel->mutex);
 
     if (parallel->arena_owned && parallel->arena)
-      arena_return(parallel->arena);
+      ecewo_arena_return(parallel->arena);
 
     return 0;
   }
 
   for (int i = 0; i < parallel->count; i++) {
     if (parallel->streams[i] && parallel->streams[i]->query_queue) {
-      increment_async_work();
+      ecewo_increment_async_work();
       parallel_conn_ctx_t *ctx = malloc(sizeof(parallel_conn_ctx_t));
       ctx->parallel = parallel;
       ctx->index = i;

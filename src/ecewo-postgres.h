@@ -13,17 +13,12 @@ typedef struct pg_query_s pg_query_t;
 typedef struct pg_pool_s PGpool;
 typedef struct pg_parallel_s PGparallel;
 
-// Consider that it may be better if
-// we remove PGquery from parameters
-// and wait for it in a context
-// as like as we do for Res.
-// Because we don't need it all time,
-// just like we don't need Res.
 typedef void (*pg_result_cb_t)(PGquery *pg, PGresult *result, void *data);
 typedef void (*pg_complete_cb_t)(PGquery *pg, void *data);
 typedef void (*pg_parallel_cb_t)(PGparallel *parallel, int success, void *data);
 
 typedef struct {
+  ecewo_app_t *app;
   const char *host;
   const char *port;
   const char *dbname;
@@ -48,7 +43,7 @@ void pg_pool_return(PGpool *pool, PGconn *conn);
 void pg_pool_get_stats(PGpool *pool, PGPoolStats *stats);
 int pg_pool_cleanup_idle(PGpool *pool, uint64_t max_idle_ms);
 
-PGquery *pg_query_create(PGpool *pool, Res *res);
+PGquery *pg_query_create(PGpool *pool, ecewo_response_t *res);
 void pg_query_on_complete(PGquery *pg, pg_complete_cb_t callback, void *data);
 
 int pg_query_queue(PGquery *pg,
@@ -67,7 +62,7 @@ int pg_query_exec_trans(PGquery *pg);
 
 // Create parallel execution context
 // count is number of parallel query streams
-PGparallel *pg_parallel_create(PGpool *pool, int count, Res *res);
+PGparallel *pg_parallel_create(PGpool *pool, int count, ecewo_response_t *res);
 
 // Get a query stream by index
 // Each stream executes on its own connection

@@ -11,13 +11,34 @@ target_include_directories(ecewo_postgres PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
 )
 
+if (PROJECT_IS_TOP_LEVEL AND NOT TARGET ecewo::ecewo)
+  include(FetchContent)
+
+  FetchContent_Declare(
+    ecewo
+    GIT_REPOSITORY https://github.com/savashn/ecewo.git
+    GIT_TAG v4
+    GIT_SHALLOW TRUE
+  )
+
+  FetchContent_MakeAvailable(ecewo)
+endif()
+
 find_package(PostgreSQL REQUIRED)
 
 target_include_directories(ecewo_postgres PRIVATE
   ${PostgreSQL_INCLUDE_DIRS}
 )
 
-target_link_libraries(ecewo_postgres PUBLIC
-  ecewo::ecewo
-  ${PostgreSQL_LIBRARIES}
-)
+if (PROJECT_IS_TOP_LEVEL AND TARGET ecewo::ecewo)
+  target_link_libraries(ecewo_postgres
+    PRIVATE
+      ecewo::ecewo
+      ecewo::postgres
+  )
+else()
+  target_link_libraries(ecewo_postgres PUBLIC
+    ecewo::ecewo
+    ${PostgreSQL_LIBRARIES}
+  )
+endif()
