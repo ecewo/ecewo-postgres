@@ -50,6 +50,8 @@ target_compile_definitions(ecewo_postgres PRIVATE ECEWO_PG_BUILDING)
 
 if(ECEWO_PG_BUILD_SHARED)
   target_compile_definitions(ecewo_postgres PUBLIC ECEWO_PG_SHARED)
+else()
+  target_compile_definitions(ecewo_postgres PUBLIC ECEWO_PG_STATIC_DEFINE)
 endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
