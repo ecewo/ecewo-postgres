@@ -2,7 +2,7 @@
 
 **Fully asynchronous PostgreSQL client for [ecewo](https://github.com/savashn/ecewo)**
 
-ecewo-postgres is a non-blocking PostgreSQL client library designed specifically for [ecewo](https://github.com/savashn/ecewo). It provides connection pooling, async query execution, transaction support, and parallel query capabilities—all fully integrated with ecewo's event loop and arena allocator.
+ecewo-postgres is a non-blocking PostgreSQL client library designed specifically for [ecewo](https://github.com/savashn/ecewo). It provides connection pooling, async query execution, transaction support, and parallel query capabilities. All fully integrated with ecewo's event loop and arena allocator.
 
 ---
 
@@ -106,7 +106,7 @@ static void get_users(ecewo_request_t *req, ecewo_response_t *res) {
     ecewo_pg_query_exec(pg);
 }
 
-static void cleanup(void) {
+static void cleanup(void *data) {
     ecewo_pg_pool_destroy(pool);
 }
 
@@ -128,7 +128,7 @@ int main(void) {
 
     ECEWO_GET(app, "/api/users", get_users);
 
-    ecewo_atexit(app, cleanup);
+    ecewo_atexit(app, cleanup, NULL);
     ecewo_listen(app, 3000);
 
     return 0;
@@ -174,9 +174,9 @@ void ecewo_pg_pool_config_set_pool_size(ecewo_pg_pool_config_t *config, int pool
 void ecewo_pg_pool_config_set_timeout_ms(ecewo_pg_pool_config_t *config, int timeout_ms);
 ```
 
-- `app` — the ecewo application instance. **Required.**
-- `pool_size` — number of physical connections, between 1 and 1024.
-- `timeout_ms` — `0` = fail immediately when no connection is free, `-1` = wait indefinitely, `> 0` = wait up to N milliseconds.
+- `app`: the ecewo application instance. **Required.**
+- `pool_size`: number of physical connections, between 1 and 1024.
+- `timeout_ms`: `0` = fail immediately when no connection is free, `-1` = wait indefinitely, `> 0` = wait up to N milliseconds.
 
 ---
 
@@ -221,11 +221,11 @@ void ecewo_pg_pool_destroy(ecewo_pg_pool_t *pool);
 
 **Example:**
 ```c
-static void cleanup(void) {
+static void cleanup(void *data) {
     ecewo_pg_pool_destroy(pool);
 }
 
-ecewo_atexit(app, cleanup);
+ecewo_atexit(app, cleanup, NULL);
 ```
 
 ---
@@ -301,9 +301,9 @@ int ecewo_pg_query_queue(ecewo_pg_query_t *pg,
                          void *query_data);
 ```
 
-- `sql` — use `$1`, `$2`, … for parameters.
-- `params` — array of string values; may be `NULL` when `param_count` is 0.
-- `result_cb` — called once per result set (valid only inside the callback); may be `NULL`.
+- `sql`: use `$1`, `$2`, … for parameters.
+- `params`: array of string values; may be `NULL` when `param_count` is 0.
+- `result_cb`: called once per result set (valid only inside the callback); may be `NULL`.
 
 **Result callback signature:**
 ```c
@@ -428,8 +428,8 @@ ecewo_pg_parallel_t *ecewo_pg_parallel_create(ecewo_pg_pool_t *pool,
                                               ecewo_response_t *res);
 ```
 
-- `count` — number of independent streams.
-- `res` may be `NULL` for non-HTTP usage.
+- `count`: number of independent streams.
+- `res`: may be `NULL` for non-HTTP usage.
 
 ---
 
@@ -458,7 +458,7 @@ typedef void (*ecewo_pg_parallel_cb_t)(ecewo_pg_parallel_t *parallel,
                                        void *data);
 ```
 
-- `success` — `1` when every stream succeeded, `0` if any failed.
+- `success`: `1` when every stream succeeded, `0` if any failed.
 
 ---
 
@@ -537,7 +537,7 @@ static void get_user(ecewo_request_t *req, ecewo_response_t *res) {
     ecewo_pg_query_exec(pg);
 }
 
-static void cleanup(void) {
+static void cleanup(void *data) {
     ecewo_pg_pool_destroy(pool);
 }
 
@@ -559,7 +559,7 @@ int main(void) {
 
     ECEWO_GET(app, "/users/:id", get_user);
 
-    ecewo_atexit(app, cleanup);
+    ecewo_atexit(app, cleanup, NULL);
     ecewo_listen(app, 3000);
 
     return 0;
@@ -598,7 +598,7 @@ static void create_user(ecewo_request_t *req, ecewo_response_t *res) {
     ecewo_pg_query_exec(pg);
 }
 
-static void cleanup(void) { ecewo_pg_pool_destroy(pool); }
+static void cleanup(void *data) { ecewo_pg_pool_destroy(pool); }
 
 int main(void) {
     ecewo_app_t *app = ecewo_create();
@@ -618,7 +618,7 @@ int main(void) {
 
     ECEWO_POST(app, "/users", create_user);
 
-    ecewo_atexit(app, cleanup);
+    ecewo_atexit(app, cleanup, NULL);
     ecewo_listen(app, 3000);
 
     return 0;
@@ -710,7 +710,7 @@ static void get_user_profile(ecewo_request_t *req, ecewo_response_t *res) {
     ecewo_pg_query_exec(pg);
 }
 
-static void cleanup(void) { ecewo_pg_pool_destroy(pool); }
+static void cleanup(void *data) { ecewo_pg_pool_destroy(pool); }
 
 int main(void) {
     ecewo_app_t *app = ecewo_create();
@@ -730,7 +730,7 @@ int main(void) {
 
     ECEWO_GET(app, "/users/:id/profile", get_user_profile);
 
-    ecewo_atexit(app, cleanup);
+    ecewo_atexit(app, cleanup, NULL);
     ecewo_listen(app, 3000);
 
     return 0;
@@ -785,7 +785,7 @@ static void create_user_with_post(ecewo_request_t *req, ecewo_response_t *res) {
     ecewo_pg_query_exec(pg);
 }
 
-static void cleanup(void) { ecewo_pg_pool_destroy(pool); }
+static void cleanup(void *data) { ecewo_pg_pool_destroy(pool); }
 
 int main(void) {
     ecewo_app_t *app = ecewo_create();
@@ -805,7 +805,7 @@ int main(void) {
 
     ECEWO_POST(app, "/users", create_user_with_post);
 
-    ecewo_atexit(app, cleanup);
+    ecewo_atexit(app, cleanup, NULL);
     ecewo_listen(app, 3000);
 
     return 0;
@@ -855,7 +855,7 @@ static void transfer_money(ecewo_request_t *req, ecewo_response_t *res) {
     ecewo_pg_query_exec_trans(pg);
 }
 
-static void cleanup(void) { ecewo_pg_pool_destroy(pool); }
+static void cleanup(void *data) { ecewo_pg_pool_destroy(pool); }
 
 int main(void) {
     ecewo_app_t *app = ecewo_create();
@@ -875,7 +875,7 @@ int main(void) {
 
     ECEWO_POST(app, "/transfer", transfer_money);
 
-    ecewo_atexit(app, cleanup);
+    ecewo_atexit(app, cleanup, NULL);
     ecewo_listen(app, 3000);
 
     return 0;
@@ -950,7 +950,7 @@ static void get_stats(ecewo_request_t *req, ecewo_response_t *res) {
     ecewo_pg_parallel_exec(parallel);
 }
 
-static void cleanup(void) { ecewo_pg_pool_destroy(pool); }
+static void cleanup(void *data) { ecewo_pg_pool_destroy(pool); }
 
 int main(void) {
     ecewo_app_t *app = ecewo_create();
@@ -970,7 +970,7 @@ int main(void) {
 
     ECEWO_GET(app, "/stats", get_stats);
 
-    ecewo_atexit(app, cleanup);
+    ecewo_atexit(app, cleanup, NULL);
     ecewo_listen(app, 3000);
 
     return 0;
@@ -983,7 +983,7 @@ int main(void) {
 
 ### 1. Always Use Parameterized Queries
 
-**Wrong — SQL injection risk:**
+**Wrong: SQL injection risk:**
 ```c
 char sql[256];
 sprintf(sql, "SELECT * FROM users WHERE email = '%s'", email);
@@ -1039,7 +1039,7 @@ static void on_result(ecewo_pg_query_t *pg, ecewo_pg_result_t *result, void *dat
 
 ### 4. Use Transactions for Related Updates
 
-**Wrong — two separate connections, no atomicity:**
+**Wrong: two separate connections, no atomicity:**
 ```c
 ecewo_pg_query_t *pg1 = ecewo_pg_query_create(pool, res);
 ecewo_pg_query_queue(pg1, "UPDATE table1 ...", ...);
@@ -1050,7 +1050,7 @@ ecewo_pg_query_queue(pg2, "UPDATE table2 ...", ...);
 ecewo_pg_query_exec(pg2);
 ```
 
-**Correct — single atomic transaction:**
+**Correct: single atomic transaction:**
 ```c
 ecewo_pg_query_t *pg = ecewo_pg_query_create(pool, res);
 ecewo_pg_query_queue(pg, "UPDATE table1 ...", 2, params1, NULL, NULL);
@@ -1173,14 +1173,14 @@ The library handles its own cleanup; the request/response arenas are freed autom
 
 The `ecewo_pg_result_t *` pointer is only valid inside the result callback.
 
-**Wrong — dangling pointer after callback returns:**
+**Wrong: dangling pointer after callback returns:**
 ```c
 static void on_result(ecewo_pg_query_t *pg, ecewo_pg_result_t *result, void *data) {
     ctx->name = ecewo_pg_result_get_value(result, 0, 0); // invalid after return
 }
 ```
 
-**Correct — copy into an arena:**
+**Correct: copy into an arena:**
 ```c
 static void on_result(ecewo_pg_query_t *pg, ecewo_pg_result_t *result, void *data) {
     my_ctx_t *ctx = (my_ctx_t *)data;
@@ -1219,7 +1219,7 @@ ecewo_pg_query_queue(pg, "SELECT COUNT(*) FROM comments WHERE user_id = $1", ...
 ecewo_pg_query_exec(pg);
 ```
 
-Avoid creating multiple handles for dependent queries — use query chaining instead.
+Avoid creating multiple handles for dependent queries. Use query chaining instead.
 
 ---
 

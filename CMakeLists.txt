@@ -9,6 +9,10 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "Choose the type of build." FORCE)
 endif()
 
+if(PROJECT_IS_TOP_LEVEL)
+  set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+endif()
+
 option(ECEWO_PG_BUILD_SHARED "Build ecewo-postgres as a shared library" OFF)
 
 if(PROJECT_IS_TOP_LEVEL AND NOT TARGET ecewo::ecewo)

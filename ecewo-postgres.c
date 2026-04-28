@@ -1570,8 +1570,6 @@ static void on_parallel_connection_ready(PGconn *conn, void *data) {
 
   ecewo_decrement_async_work();
 
-  free(ctx);
-
   if (!ecewo_is_running(parallel->pool ? parallel->pool->app : NULL)) {
     if (conn && parallel->pool)
       pool_release(parallel->pool, conn);
@@ -1654,7 +1652,7 @@ int ecewo_pg_parallel_exec(ecewo_pg_parallel_t *parallel) {
   for (int i = 0; i < parallel->count; i++) {
     if (parallel->streams[i] && parallel->streams[i]->query_queue) {
       ecewo_increment_async_work();
-      parallel_conn_ctx_t *ctx = malloc(sizeof(parallel_conn_ctx_t));
+      parallel_conn_ctx_t *ctx = ecewo_alloc(parallel->arena, sizeof(parallel_conn_ctx_t));
       if (!ctx) {
         ecewo_decrement_async_work();
         LOG_ERROR("ecewo_pg_parallel_exec: Failed to allocate connection context for stream %d", i);
