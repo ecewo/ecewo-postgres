@@ -62,7 +62,7 @@ pacman -S mingw-w64-x86_64-libpq
 ### Add as a dependency
 
 ```cmake
-ecewo_plugin(postgres)
+ecewo_plugin(postgres@v0.2.0)
 
 target_link_libraries(app PRIVATE
     ecewo::ecewo
