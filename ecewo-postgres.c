@@ -86,12 +86,49 @@ typedef struct pool_wait_s {
   bool cancelled;
 } pool_wait_t;
 
+/* libpq connection settings, kept as separate fields so they can be handed to
+ * PQconnectdbParams verbatim - see conn_params_copy(). */
+typedef struct {
+  char *host;
+  char *port;
+  char *dbname;
+  char *user;
+  char *password;
+  char *sslmode;
+} pg_conn_params_t;
+
+static char *dup_or_empty(const char *s) {
+  const char *src = s ? s : "";
+  size_t n = strlen(src);
+  char *copy = malloc(n + 1);
+  if (!copy)
+    return NULL;
+  memcpy(copy, src, n + 1);
+  return copy;
+}
+
+static void conn_params_free(pg_conn_params_t *p) {
+  if (!p)
+    return;
+  free(p->host);
+  free(p->port);
+  free(p->dbname);
+  free(p->user);
+  if (p->password) {
+    /* Don't leave the password sitting in freed heap memory. */
+    memset(p->password, 0, strlen(p->password));
+    free(p->password);
+  }
+  free(p->sslmode);
+  memset(p, 0, sizeof(*p));
+}
+
 struct ecewo_pg_pool_s {
   ecewo_app_t *app;
   pool_connection_t *connections;
   uint16_t size;
   int timeout_ms;
-  char *conninfo;
+  pg_conn_params_t params;
   uv_mutex_t mutex;
   pool_wait_t *wait_queue_head;
   pool_wait_t *wait_queue_tail;
@@ -106,6 +143,7 @@ struct ecewo_pg_pool_config_s {
   char *dbname;
   char *user;
   char *password;
+  char *sslmode;
   int pool_size;
   int timeout_ms;
 };
@@ -198,27 +236,30 @@ static void on_pool_timeout(uv_timer_t *handle) {
   uv_close((uv_handle_t *)handle, (uv_close_cb)free);
 }
 
-static char *build_conninfo(const ecewo_pg_pool_config_t *config) {
-  const char *host = config->host ? config->host : "";
-  const char *port = config->port ? config->port : "";
-  const char *dbname = config->dbname ? config->dbname : "";
-  const char *user = config->user ? config->user : "";
-  const char *password = config->password ? config->password : "";
+/* Connection settings are passed to libpq as separate keyword/value arrays.
+ * Building a single conninfo string instead would need libpq's own quoting
+ * rules: a space or a quote in any field (a password, most obviously) would
+ * otherwise start a new keyword and let the caller's data inject connection
+ * parameters such as sslmode=disable or a different host. */
+static bool conn_params_copy(pg_conn_params_t *out,
+                             const ecewo_pg_pool_config_t *config) {
+  memset(out, 0, sizeof(*out));
+  out->host = dup_or_empty(config->host);
+  out->port = dup_or_empty(config->port);
+  out->dbname = dup_or_empty(config->dbname);
+  out->user = dup_or_empty(config->user);
+  out->password = dup_or_empty(config->password);
+  /* libpq defaults to sslmode=prefer, which neither verifies the server
+   * certificate nor refuses to fall back to plaintext. Require TLS unless the
+   * application deliberately says otherwise. */
+  out->sslmode = dup_or_empty(config->sslmode ? config->sslmode : "require");
 
-  size_t len = snprintf(NULL, 0,
-                        "host=%s port=%s dbname=%s user=%s password=%s",
-                        host, port, dbname, user, password)
-      + 1;
-
-  char *conninfo = malloc(len);
-  if (!conninfo)
-    return NULL;
-
-  snprintf(conninfo, len,
-           "host=%s port=%s dbname=%s user=%s password=%s",
-           host, port, dbname, user, password);
-
-  return conninfo;
+  if (!out->host || !out->port || !out->dbname || !out->user
+      || !out->password || !out->sslmode) {
+    conn_params_free(out);
+    return false;
+  }
+  return true;
 }
 
 typedef struct {
@@ -307,8 +348,15 @@ static void pg_async_reset(PGconn *conn,
   on_reset_ready(&ctx->poll, 0, 0);
 }
 
-static PGconn *pg_connect(const char *conninfo) {
-  PGconn *conn = PQconnectdb(conninfo);
+static PGconn *pg_connect(const pg_conn_params_t *p) {
+  const char *keywords[] = {
+    "host", "port", "dbname", "user", "password", "sslmode", NULL
+  };
+  const char *values[] = {
+    p->host, p->port, p->dbname, p->user, p->password, p->sslmode, NULL
+  };
+
+  PGconn *conn = PQconnectdbParams(keywords, values, 0);
 
   if (!conn || PQstatus(conn) != CONNECTION_OK) {
     if (conn) {
@@ -350,6 +398,7 @@ void ecewo_pg_pool_config_free(ecewo_pg_pool_config_t *config) {
   free(config->dbname);
   free(config->user);
   free(config->password);
+  free(config->sslmode);
   free(config);
 }
 
@@ -380,6 +429,13 @@ void ecewo_pg_pool_config_set_user(ecewo_pg_pool_config_t *config, const char *u
 
 void ecewo_pg_pool_config_set_password(ecewo_pg_pool_config_t *config, const char *password) {
   if (config) config_set_string(&config->password, password);
+}
+
+/* libpq sslmode: "require" (default), "verify-ca", "verify-full", "prefer",
+ * "allow", "disable". Anything below "require" allows a silent plaintext
+ * fallback; "verify-full" additionally authenticates the server. */
+void ecewo_pg_pool_config_set_sslmode(ecewo_pg_pool_config_t *config, const char *sslmode) {
+  if (config) config_set_string(&config->sslmode, sslmode);
 }
 
 void ecewo_pg_pool_config_set_pool_size(ecewo_pg_pool_config_t *config, int pool_size) {
@@ -414,8 +470,7 @@ ecewo_pg_pool_t *ecewo_pg_pool_create(const ecewo_pg_pool_config_t *config) {
   memset(pool, 0, sizeof(ecewo_pg_pool_t));
 
   pool->app = config->app;
-  pool->conninfo = build_conninfo(config);
-  if (!pool->conninfo) {
+  if (!conn_params_copy(&pool->params, config)) {
     free(pool);
     return NULL;
   }
@@ -429,7 +484,7 @@ ecewo_pg_pool_t *ecewo_pg_pool_create(const ecewo_pg_pool_config_t *config) {
 
   if (uv_mutex_init(&pool->mutex) != 0) {
     LOG_ERROR("Failed to initialize mutex");
-    free(pool->conninfo);
+    conn_params_free(&pool->params);
     free(pool);
     return NULL;
   }
@@ -438,14 +493,14 @@ ecewo_pg_pool_t *ecewo_pg_pool_create(const ecewo_pg_pool_config_t *config) {
   if (!pool->connections) {
     LOG_ERROR("Failed to allocate connections array");
     uv_mutex_destroy(&pool->mutex);
-    free(pool->conninfo);
+    conn_params_free(&pool->params);
     free(pool);
     return NULL;
   }
 
   int connected = 0;
   for (int i = 0; i < pool->size; i++) {
-    PGconn *conn = pg_connect(pool->conninfo);
+    PGconn *conn = pg_connect(&pool->params);
 
     if (conn) {
       pool->connections[i].conn = conn;
@@ -500,7 +555,7 @@ void ecewo_pg_pool_destroy(ecewo_pg_pool_t *pool) {
   uv_mutex_destroy(&pool->mutex);
 
   free(pool->connections);
-  free(pool->conninfo);
+  conn_params_free(&pool->params);
   free(pool);
 }
 

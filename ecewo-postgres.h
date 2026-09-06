@@ -69,6 +69,11 @@ ECEWO_PG_EXPORT void ecewo_pg_pool_config_set_user(ecewo_pg_pool_config_t *confi
 /** Set the user password. */
 ECEWO_PG_EXPORT void ecewo_pg_pool_config_set_password(ecewo_pg_pool_config_t *config, const char *password);
 
+/** libpq sslmode for pool connections. Defaults to "require", so TLS is not
+ *  silently skipped; use "verify-full" (with a CA in the environment) to also
+ *  authenticate the server, or "disable" for a trusted local socket. */
+ECEWO_PG_EXPORT void ecewo_pg_pool_config_set_sslmode(ecewo_pg_pool_config_t *config, const char *sslmode);
+
 /** Set the number of physical connections maintained by the pool. Must be in [1, 1024]. */
 ECEWO_PG_EXPORT void ecewo_pg_pool_config_set_pool_size(ecewo_pg_pool_config_t *config, int pool_size);
 
